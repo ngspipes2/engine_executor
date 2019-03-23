@@ -1,0 +1,35 @@
+ # -*- mode: ruby -*-
+# vi: set ft=ruby :
+require 'json'
+
+VAGRANTFILE_API_VERSION = "2"
+
+current_dir    = File.dirname(File.expand_path(__FILE__))
+json = File.read("#{current_dir}/config.json")
+vagrant_config  = JSON.parse(json)
+
+
+Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
+  config.vm.box = "envimation/ubuntu-xenial-docker"
+
+ config.vm.define vagrant_config['hostname'] do |ngs|
+    ngs.vm.provider :virtualbox do |vb|
+      vb.name = vagrant_config['hostname']
+      vb.customize [
+        "setextradata", :id,
+        "VBoxInternal2/SharedFoldersEnableSymlinksCreate/vagrant-root", "1"
+      ]
+
+      config.vm.network "private_network", ip: vagrant_config['ip_address']
+
+      vb.customize [
+        'modifyvm', :id,
+        '--natdnshostresolver1', 'on',
+        '--memory', vagrant_config['vm_ram'],
+        '--cpus', vagrant_config['vm_cpus']
+      ]
+      config.vm.synced_folder vagrant_config['share_path'], "/home/vagrant/" + vagrant_config['pipeline_name'], type: :virtualbox
+
+    end
+  end
+end
