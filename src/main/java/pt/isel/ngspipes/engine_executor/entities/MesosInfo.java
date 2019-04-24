@@ -20,7 +20,7 @@ public class MesosInfo {
         this.sshUser = sshUser;
         this.sshPassword = sshPassword;
         this.sshPort = sshPort;
-        this.chronosEndPoint = chronosEndPoint;
+        this.chronosEndPoint = chronosEndPoint.charAt(chronosEndPoint.length() - 1) == '/' ? chronosEndPoint : chronosEndPoint + "/";
         this.baseDirectory = baseDirectory;
     }
 

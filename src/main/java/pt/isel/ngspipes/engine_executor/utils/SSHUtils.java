@@ -3,9 +3,13 @@ package pt.isel.ngspipes.engine_executor.utils;
 import com.jcraft.jsch.*;
 
 import java.io.*;
-import java.util.Properties;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class SSHUtils {
+
+    static Collection<String> IGNORE_FILES = new LinkedList<>(Arrays.asList("." , ".."));
 
     public static ChannelSftp getChannelSftp(SSHConfig sshConfig) throws JSchException {
         Session session = getSessionByConfig(sshConfig);
@@ -22,46 +26,11 @@ public class SSHUtils {
         sftp.cd(dest);
         System.out.println("directory: " + dest);
         if(file.isFile()){
-            InputStream ins = new FileInputStream(file);
-            sftp.put(ins, new String(file.getName().getBytes(),"UTF-8"));
-            sftp.chmod(511, dest + fileSeparator + file.getName());
+            uploadFile(dest, sftp, fileSeparator, file);
         } else if(file.isDirectory() || file.listFiles() == null) {
             createFolder(file.getPath(), sftp);
         } else {
-            File[] files = file.listFiles();
-            for (File file2 : files) {
-                String dir = file2.getAbsolutePath();
-                if(file2.isDirectory()){
-                    String str = dir.substring(dir.lastIndexOf(fileSeparator));
-                    dest = dest + str;
-                }
-                System.out.println("directory is :" + dest);
-                upload(base_dir, dest, source + dir, sftp, fileSeparator);
-            }
-        }
-    }
-
-    public static void copy(String base_dir, String source, String dest, String inputName, SSHConfig config, String fileSeparator) throws JSchException, InterruptedException, SftpException {
-        ChannelSftp sftp = null;
-        try {
-            sftp = SSHUtils.getChannelSftp(config);
-            createIfNotExist(base_dir, dest, sftp, fileSeparator);
-            String cpyCmd = "cp -R " + source + inputName + " " + dest;
-            Session session = sftp.getSession();
-            ChannelExec channel = (ChannelExec) session.openChannel("exec");
-            channel.setCommand(cpyCmd);
-            channel.connect();
-            while(channel.isConnected()) {
-                Thread.sleep(20);
-            }
-            int status = channel.getExitStatus();
-            if(status != 0)
-                throw new JSchException("Error copying input file " + inputName);
-
-        } finally {
-            if(sftp != null) {
-                sftp.disconnect();
-            }
+            uploadDirectoryFiles(base_dir, dest, source, sftp, fileSeparator, file);
         }
     }
 
@@ -74,6 +43,90 @@ public class SSHUtils {
             createFolder(folder, sftp);
         }
         sftp.chmod(511, folderPath);
+    }
+
+    public static void download(String base_dir, String dest, String fileName, ChannelSftp sftp, String type) throws SftpException, IOException {
+        sftp.cd(base_dir);
+        String directory = "directory";
+        if (type.equalsIgnoreCase(directory)) {
+            downloadDirectory(dest, fileName, sftp, directory);
+        } else if (type.equalsIgnoreCase("file")) {
+            downloadFile(dest, fileName, sftp);
+        } else if (type.equalsIgnoreCase("file[]")) {
+            downloadListOfFiles(base_dir, dest, fileName, sftp);
+        }
+    }
+
+
+
+    private static void downloadListOfFiles(String base_dir, String dest, String source, ChannelSftp sftp) throws SftpException, IOException {
+        Vector fileList = sftp.ls(base_dir);
+        Pattern pattern = Pattern.compile(source);
+        for(int i=0; i< fileList.size(); i++) {
+            ChannelSftp.LsEntry entry = (ChannelSftp.LsEntry) fileList.get(i);
+            String filename = entry.getFilename();
+            Matcher m = pattern.matcher(filename);
+            if (IGNORE_FILES.contains(filename) || !m.matches())
+                continue;
+
+            downloadFile(dest, filename, sftp);
+        }
+    }
+
+    private static void downloadDirectory(String dest, String filename, ChannelSftp sftp, String directory) throws SftpException, IOException {
+        Vector filelist = sftp.ls(filename);
+        for(int i=0; i< filelist.size(); i++) {
+            ChannelSftp.LsEntry entry = (ChannelSftp.LsEntry) filelist.get(i);
+            String subFilename = entry.getFilename();
+            if (IGNORE_FILES.contains(subFilename))
+                continue;
+            else if (entry.getAttrs().isDir()) {
+                File destFile = new File(dest + File.separatorChar + subFilename);
+                destFile.mkdirs();
+                download(dest, subFilename, subFilename, sftp, directory);
+            } else {
+                String lpwd = sftp.pwd();
+                if (!lpwd.contains(filename)) {
+                    sftp.cd(filename);
+                    File directoryFile = new File(dest + File.separatorChar + filename);
+                    directoryFile.mkdirs();
+                }
+                downloadFile(dest + File.separatorChar + filename, subFilename, sftp);
+            }
+        }
+    }
+
+    private static void uploadDirectoryFiles(String base_dir, String dest, String source, ChannelSftp sftp, String fileSeparator, File file) throws SftpException, FileNotFoundException, UnsupportedEncodingException {
+        File[] files = file.listFiles();
+        for (File file2 : files) {
+            String dir = file2.getAbsolutePath();
+            if(file2.isDirectory()){
+                String str = dir.substring(dir.lastIndexOf(fileSeparator));
+                dest = dest + str;
+            }
+            System.out.println("directory is :" + dest);
+            upload(base_dir, dest, source + dir, sftp, fileSeparator);
+        }
+    }
+
+    private static void uploadFile(String dest, ChannelSftp sftp, String fileSeparator, File file) throws FileNotFoundException, SftpException, UnsupportedEncodingException {
+        InputStream ins = new FileInputStream(file);
+        sftp.put(ins, new String(file.getName().getBytes(),"UTF-8"));
+        sftp.chmod(511, dest + fileSeparator + file.getName());
+    }
+
+    private static void downloadFile(String dest, String filename, ChannelSftp sftp) throws SftpException, IOException {
+        BufferedInputStream bis = new BufferedInputStream(sftp.get(filename));
+        File destFile = new File(dest + File.separatorChar + filename);
+        OutputStream os = new FileOutputStream(destFile);
+        BufferedOutputStream bos = new BufferedOutputStream(os);
+        byte[] buffer = new byte[1024];
+        int readCount;
+        while ((readCount = bis.read(buffer)) > 0) {
+            bos.write(buffer, 0, readCount);
+        }
+        bis.close();
+        bos.close();
     }
 
     private static void createFolder(String folderPath, ChannelSftp sftp) throws SftpException {

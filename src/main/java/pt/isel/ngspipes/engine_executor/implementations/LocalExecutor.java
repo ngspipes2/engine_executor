@@ -2,6 +2,7 @@ package pt.isel.ngspipes.engine_executor.implementations;
 
 import com.github.brunomndantas.tpl4j.factory.TaskFactory;
 import com.github.brunomndantas.tpl4j.task.Task;
+import org.apache.logging.log4j.Logger;
 import pt.isel.ngspipes.engine_common.entities.ExecutionNode;
 import pt.isel.ngspipes.engine_common.entities.ExecutionState;
 import pt.isel.ngspipes.engine_common.entities.StateEnum;
@@ -11,8 +12,6 @@ import pt.isel.ngspipes.engine_common.exception.ExecutorException;
 import pt.isel.ngspipes.engine_common.exception.ProgressReporterException;
 import pt.isel.ngspipes.engine_common.executionReporter.IExecutionProgressReporter;
 import pt.isel.ngspipes.engine_common.interfaces.IExecutor;
-import org.apache.logging.log4j.Logger;
-import sun.reflect.generics.reflectiveObjects.NotImplementedException;
 import pt.isel.ngspipes.engine_common.utils.IOUtils;
 import pt.isel.ngspipes.engine_common.utils.SpreadJobExpander;
 import pt.isel.ngspipes.engine_common.utils.TopologicSorter;
@@ -59,19 +58,25 @@ public abstract class LocalExecutor implements IExecutor {
     }
 
     @Override
-    public void getPipelineOutputs(String executionId, String outputDirectory) {
-        //TODO
-        throw new NotImplementedException();
+    public void getPipelineOutputs(Pipeline pipeline, String outputDirectory) throws ExecutorException {
+        for (Output output : pipeline.getOutputs()) {
+            getPipelineOutput(output, pipeline, outputDirectory);
+        }
     }
 
     @Override
     public String getWorkingDirectory() { return workingDirectory; }
 
+    @Override
+    public String getFileSeparator() {
+        return File.separatorChar + "";
+    }
+
+
     abstract void finishSuccessfully(Pipeline pipeline) throws ExecutorException, ProgressReporterException;
-    abstract void finishOnError(Pipeline pipeline) throws ExecutorException, ProgressReporterException;
+    abstract void finishOnError(Pipeline pipeline, Exception ex) throws ExecutorException, ProgressReporterException;
     abstract String getExecutionCommand(SimpleJob job, Pipeline pipeline) throws ExecutorException;
     abstract void executeJob(String executeCmd, Job job, Pipeline pipeline) throws ExecutorException;
-
 
 
     protected void copyPipelineInputs(Pipeline pipeline) throws ExecutorException {
@@ -92,7 +97,7 @@ public abstract class LocalExecutor implements IExecutor {
         createTasks(graph, pipeline, taskMap);
         scheduleFinishPipelineTask(pipeline, taskMap);
         scheduleChildTasks(pipeline, taskMap);
-        scheduleParentsTasks(graph, pipeline.getName(), taskMap);
+        executeParents(graph, taskMap);
     }
 
 
@@ -115,8 +120,8 @@ public abstract class LocalExecutor implements IExecutor {
                 try {
                     runTask(job, pipeline);
                 } catch (ExecutorException e) {
-                    updateState(pipeline, job, e, StateEnum.FAILED);
-                    finishOnError(pipeline);
+                    updateState(job, e, StateEnum.FAILED);
+                    finishOnError(pipeline, e);
                     throw e;
                 }
             });
@@ -130,8 +135,6 @@ public abstract class LocalExecutor implements IExecutor {
     private void scheduleFinishPipelineTask(Pipeline pipeline, Map<Job, Task<Void>> taskMap) {
         Task<Void> task = TaskFactory.create("finish" + pipeline.getName(), () -> {
             try {
-                pipeline.getState().setState(StateEnum.SUCCESS);
-                reporter.reportInfo("Pipeline Finished");
                 finishSuccessfully(pipeline);
             } catch (Exception e) {
                 reporter.reportError("Error finishing pipeline");
@@ -153,14 +156,19 @@ public abstract class LocalExecutor implements IExecutor {
         }
     }
 
-    private void scheduleParentsTasks(Collection<ExecutionNode> executionGraph, String executionId,
-                                      Map<Job, Task<Void>> taskMap) throws ExecutorException {
+    private void getPipelineOutput(Output output, Pipeline pipeline, String outputDirectory) throws ExecutorException {
+        Job outputJob = pipeline.getJobById(output.getOriginJob());
         try {
-            executeParents(executionGraph, taskMap);
-        } catch (ExecutorException e) {
-            ExecutionState state = new ExecutionState(StateEnum.FAILED, e);
-            updatePipelineState(executionId, state);
-            throw e;
+            String type = output.getType();
+            if (type.equalsIgnoreCase("directory")) {
+                String outVal = File.separatorChar + output.getValue().toString();
+                IOUtils.copyDirectory(outputJob.getEnvironment().getOutputsDirectory() + outVal, outputDirectory + outVal);
+            } else if (type.equalsIgnoreCase("file") || type.equalsIgnoreCase("file[]")) {
+                String outVal = File.separatorChar + output.getValue().toString();
+                IOUtils.copyFile(outputJob.getEnvironment().getOutputsDirectory() + outVal, outputDirectory + outVal);
+            }
+        } catch (IOException e) {
+            throw new ExecutorException("Error getting pipeline " + output.getName() + " output.", e);
         }
     }
 
@@ -250,17 +258,23 @@ public abstract class LocalExecutor implements IExecutor {
             IOUtils.createFolder(job.getEnvironment().getOutputsDirectory());
             job.getState().setState(StateEnum.RUNNING);
             executeJob(executeCmd, job, pipeline);
-            validateOutputs(job, pipeline.getName());
+            validateOutputs(job);
         } catch (ExecutorException | ProgressReporterException e) {
             logger.error("Executing step: " + job.getId()
                     + " from pipeline: " + pipeline.getName(), e);
-            updateState(pipeline, job, e, StateEnum.FAILED);
+            updateState(job, e, StateEnum.FAILED);
+            try {
+                finishOnError(pipeline, e);
+            } catch (ProgressReporterException e1) {
+                throw new ExecutorException("Error executing step: " + job.getId()
+                        + " from pipeline: " + pipeline.getName(), e);
+            }
             throw new ExecutorException("Error executing step: " + job.getId()
                     + " from pipeline: " + pipeline.getName(), e);
         }
     }
 
-    private void validateOutputs(SimpleJob job, String pipelineName) throws ExecutorException {
+    private void validateOutputs(SimpleJob job) throws ExecutorException {
         for (Output outCtx : job.getOutputs()) {
             String type = outCtx.getType();
             if (type.contains("ile") || type.contains("irectory")) {
@@ -349,14 +363,9 @@ public abstract class LocalExecutor implements IExecutor {
         return new LinkedList<>(fileNamesByPattern);
     }
 
-    private void updateState(Pipeline pipeline, Job job, Exception e, StateEnum state) {
+    private void updateState(Job job, Exception e, StateEnum state) {
         ExecutionState newState = new ExecutionState(state, e);
         job.setState(newState);
-        pipeline.setState(newState);
-    }
-
-    private void updatePipelineState(String executionId, ExecutionState state) {
-        pipelines.get(executionId).setState(state);
     }
 
     private void copyInput(Job job, Input input) throws ExecutorException {
@@ -374,9 +383,9 @@ public abstract class LocalExecutor implements IExecutor {
                         value = value.replace(" ", "");
                         String[] values = value.split(",");
                         for (String val : values)
-                            copyInput(val, job);
+                            copyInput(val, job, fileName);
                     } else  {
-                        copyInput(value, job);
+                        copyInput(value, job, fileName);
                     }
                     input.setValue(fileName);
                 }
@@ -384,9 +393,8 @@ public abstract class LocalExecutor implements IExecutor {
         }
     }
 
-    private void copyInput(String input, Job stepCtx) throws ExecutorException {
-        String inputName = input.substring(input.lastIndexOf(File.separatorChar) - 1);
-        String destInput = stepCtx.getEnvironment().getWorkDirectory() + inputName;
+    private void copyInput(String input, Job stepCtx, String inputName) throws ExecutorException {
+        String destInput = stepCtx.getEnvironment().getWorkDirectory() + File.separatorChar + inputName;
         try {
             IOUtils.copyFile(input, destInput);
         } catch (IOException e) {

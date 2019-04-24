@@ -57,7 +57,7 @@ public class ProcessRunner {
 
             inputThread.join();
             errorThread.join();
-        } catch (Exception ex) {
+        } catch (Throwable ex) {
             try {
                 reporter.reportInfo(ex.getMessage());
             } catch (ProgressReporterException e) {

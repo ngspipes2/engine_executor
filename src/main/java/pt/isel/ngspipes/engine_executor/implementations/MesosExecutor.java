@@ -4,24 +4,24 @@ import com.github.brunomndantas.tpl4j.factory.TaskFactory;
 import com.jcraft.jsch.ChannelSftp;
 import com.jcraft.jsch.JSchException;
 import com.jcraft.jsch.SftpException;
-import pt.isel.ngspipes.engine_common.entities.contexts.*;
-import pt.isel.ngspipes.engine_common.utils.*;
-import pt.isel.ngspipes.engine_executor.entities.*;
-import pt.isel.ngspipes.engine_executor.utils.HttpUtils;
-import pt.isel.ngspipes.engine_executor.utils.SSHConfig;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import pt.isel.ngspipes.engine_common.entities.Environment;
 import pt.isel.ngspipes.engine_common.entities.ExecutionNode;
 import pt.isel.ngspipes.engine_common.entities.ExecutionState;
 import pt.isel.ngspipes.engine_common.entities.StateEnum;
-import pt.isel.ngspipes.engine_executor.entities.factory.ChronosJobStatusFactory;
+import pt.isel.ngspipes.engine_common.entities.contexts.*;
 import pt.isel.ngspipes.engine_common.exception.CommandBuilderException;
 import pt.isel.ngspipes.engine_common.exception.EngineCommonException;
 import pt.isel.ngspipes.engine_common.exception.ExecutorException;
 import pt.isel.ngspipes.engine_common.exception.ProgressReporterException;
 import pt.isel.ngspipes.engine_common.executionReporter.IExecutionProgressReporter;
 import pt.isel.ngspipes.engine_common.interfaces.IExecutor;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
+import pt.isel.ngspipes.engine_common.utils.*;
+import pt.isel.ngspipes.engine_executor.entities.*;
+import pt.isel.ngspipes.engine_executor.entities.factory.ChronosJobStatusFactory;
+import pt.isel.ngspipes.engine_executor.utils.HttpUtils;
+import pt.isel.ngspipes.engine_executor.utils.SSHConfig;
 import pt.isel.ngspipes.engine_executor.utils.SSHUtils;
 import sun.reflect.generics.reflectiveObjects.NotImplementedException;
 
@@ -36,15 +36,12 @@ import java.util.stream.Collectors;
 public class MesosExecutor implements IExecutor {
 
     private static final String TAG = "MesosEngine";
-    private static final String CHRONOS_DEPENDENCY = "dependency";
-    private static final String CHRONOS_ISO = "iso8601";
-    private static final String CHRONOS_JOB = "jobs";
-    private static final String CHRONOS_JOB_SEARCH = "jobs/search?name=";
-    private static final String WORK_DIRECTORY = System.getProperty("user.home") + File.separatorChar + "NGSPipes" +
-            File.separatorChar + "Engine";
+    private static final String CHRONOS_DEPENDENCY = "scheduler/dependency";
+    private static final String CHRONOS_ISO = "scheduler/iso8601";
+    private static final String CHRONOS_JOB = "scheduler/jobs";
+    private static final String CHRONOS_JOB_SEARCH = "scheduler/jobs/search?name=";
     private static final String EPSILON = "P1Y12M12D";
     private static final String FILE_SEPARATOR = "/";
-
 
     private ChannelSftp channelSftp;
     private final Map<String, Collection<Job>> TASKS_BY_EXEC_ID = new HashMap<>();
@@ -61,7 +58,7 @@ public class MesosExecutor implements IExecutor {
     }
 
     public MesosExecutor(IExecutionProgressReporter reporter, MesosInfo mesosInfo) {
-        this(reporter, mesosInfo, WORK_DIRECTORY);
+        this(reporter, mesosInfo, mesosInfo.getBaseDirectory());
     }
 
     @Override
@@ -86,12 +83,19 @@ public class MesosExecutor implements IExecutor {
     }
 
     @Override
-    public void getPipelineOutputs(String executionId, String outputDirectory) throws ExecutorException {
-
+    public void getPipelineOutputs(Pipeline pipeline, String outputDirectory) throws ExecutorException {
+        for (Output output : pipeline.getOutputs()) {
+            getPipelineOutput(output, pipeline, outputDirectory);
+        }
     }
 
     @Override
     public String getWorkingDirectory() {  return workingDirectory; }
+
+    @Override
+    public String getFileSeparator() {
+        return FILE_SEPARATOR;
+    }
 
 
     private void copyPipelineInputs(Pipeline pipeline) throws ExecutorException {
@@ -173,11 +177,23 @@ public class MesosExecutor implements IExecutor {
         reporter.reportInfo("Pipeline Finished");
     }
 
+    private void getPipelineOutput(Output output, Pipeline pipeline, String outputDirectory) throws ExecutorException {
+        Job outputJob = pipeline.getJobById(output.getOriginJob());
+        try {
+            String outVal = output.getValue().toString();
+            String outputsDirectory = outputJob.getEnvironment().getOutputsDirectory();
+            String dest = outputDirectory + File.separatorChar;
+            SSHUtils.download(outputsDirectory, dest, outVal, channelSftp, output.getType());
+        } catch (IOException | SftpException e) {
+            throw new ExecutorException("Error getting pipeline " + output.getName() + " output.", e);
+        }
+    }
+
     private void run(SimpleJob job, String chronosJob, Pipeline pipeline) throws ExecutorException {
         try {
             reporter.reportInfo("Executing step: " + job.getId()
                     + " from pipeline: " + pipeline.getName());
-            IOUtils.createFolder(job.getEnvironment().getOutputsDirectory());
+            SSHUtils.createIfNotExist(workingDirectory, job.getEnvironment().getOutputsDirectory(), channelSftp, FILE_SEPARATOR);
             String url = mesosInfo.getChronosEndPoint() + CHRONOS_ISO;
             if (!job.getParents().isEmpty())
                 url = mesosInfo.getChronosEndPoint() + CHRONOS_DEPENDENCY;
@@ -185,7 +201,7 @@ public class MesosExecutor implements IExecutor {
             String jobId = pipeline.getName() + "_" + job.getId();
             validateOutputs(job, pipeline.getName());
             runInconclusiveDependencies(job, pipeline, this::waitUntilJobFinish, jobId, pipeline.getName());
-        } catch (IOException | ProgressReporterException e) {
+        } catch (IOException | SftpException | ProgressReporterException e) {
             logger.error("Executing step: " + job.getId()
                     + " from pipeline: " + pipeline.getName(), e);
             throw new ExecutorException("Error executing step: " + job.getId()
@@ -209,10 +225,11 @@ public class MesosExecutor implements IExecutor {
                 }
             }
         }
+//        chronosJobCmd.append("&& chmod -R 777 ").append(outputDir);
         try {
             String parent = executionId + "_" + stepCtx.getId();
             String id = "validateOutputs";
-            String chronosJob = getDependentChronosJob(chronosJobCmd.toString(), Collections.singletonList(parent), id);
+            String chronosJob = getDependentChronosJob(chronosJobCmd.toString(), Collections.singletonList(parent), id + parent);
             HttpUtils.post(mesosInfo.getChronosEndPoint() + CHRONOS_DEPENDENCY, chronosJob);
         } catch (IOException e) {
             logger.error("Error step: " + stepCtx.getId() + " didn't produces all outputs." , e);
@@ -258,7 +275,7 @@ public class MesosExecutor implements IExecutor {
     }
 
     private String getSuccessChronosJob(List<Job> executionJobs, String jobId, String pipelineName) throws IOException {
-        List<String> parents = executionJobs.stream().map((job)-> "validateOutputs_" + pipelineName + "_" + job.getId()).collect(Collectors.toList());
+        List<String> parents = executionJobs.stream().map((job)-> "validateOutputs" + pipelineName + "_" + job.getId()).collect(Collectors.toList());
         return getDependentChronosJob("ls", parents, jobId);
     }
 
@@ -302,6 +319,10 @@ public class MesosExecutor implements IExecutor {
 
     private void copyChainInputs(SimpleJob job, Pipeline pipeline) throws ExecutorException {
         String destDir = job.getEnvironment().getWorkDirectory() + FILE_SEPARATOR;
+        String jobName = pipeline.getName() + "_" +  job.getId() + "_cp_chains";
+        StringBuilder command = new StringBuilder();
+        List<String> parents = new LinkedList<>();
+        boolean first = true;
 
         for (Input inputCtx : job.getInputs()) {
             if (!inputCtx.getOriginStep().equals(job.getId())) {
@@ -309,20 +330,28 @@ public class MesosExecutor implements IExecutor {
                 String outDir = chainStep.getEnvironment().getOutputsDirectory() + FILE_SEPARATOR;
                 Output outCtx = chainStep.getOutputById(inputCtx.getChainOutput());
                 List<String> usedBy = outCtx.getUsedBy();
-                String jobName = pipeline.getName() + job.getId() + "_cp_outputs" + chainStep.getId();
 
+                if (first) {
+                    first = false;
+                } else {
+                    command.append(" && ");
+                }
+
+                parents.add("validateOutputs" + pipeline.getName() + "_" + chainStep.getId());
                 if (usedBy != null) {
                     for (String dependent : usedBy) {
                         Output outputCtx = chainStep.getOutputById(dependent);
                         String value = outputCtx.getValue().toString();
-                        copyInput(pipeline.getName() + "_" + chainStep.getId(), jobName + dependent, destDir, outDir, value);
+                        command.append(getCopyInputCommand(destDir, outDir, value));
                     }
                 } else {
                     String value = outCtx.getValue().toString();
-                    copyInput(pipeline.getName() + "_" + chainStep.getId(), jobName + outCtx.getName(), destDir, outDir, value);
+                    command.append(getCopyInputCommand(destDir, outDir, value));
                 }
             }
         }
+        if (command.length() > 0)
+            getCopyChainInputsChronosJob(jobName, command.toString(), parents);
     }
 
     private String getChronosJob(SimpleJob job, Pipeline pipeline) throws ExecutorException {
@@ -333,7 +362,6 @@ public class MesosExecutor implements IExecutor {
     private String  getExecutionCommand(SimpleJob job, Pipeline pipeline) throws ExecutorException {
         try {
             String command = CommandBuilderSupplier.getCommandBuilder("Local").build(pipeline, job, FILE_SEPARATOR, job.getExecutionContext().getConfig());
-//            String command = job.getCommandBuilder().build(pipeline, job);
             return command;
         } catch (CommandBuilderException e) {
             logger.error(TAG + ":: Error when building step - " + job.getId(), e);
@@ -381,14 +409,30 @@ public class MesosExecutor implements IExecutor {
         }
     }
 
-    private List<String> getParents(SimpleJob job, String pipelineName) throws ExecutorException {
-        String uri = mesosInfo.getChronosEndPoint() + CHRONOS_JOB + "/search?name=" + pipelineName + job.getId();
-        try {
-            String parentJobsName = HttpUtils.get(uri);
-            return JacksonUtils.readPropertyValues(parentJobsName, "name");
-        } catch (IOException e) {
-            throw new ExecutorException("Error getting parent dependency", e);
+    private List<String> getParents(SimpleJob job, String pipelineName) {
+        List<String> parents = new LinkedList<>();
+        for (String parent : job.getParents()) {
+            if (!isChainJob(job.getInputs(), parent))
+                parents.add("validateOutputs" + pipelineName + "_" + parent);
         }
+
+        if (isChainJob(job.getInputs()))
+            parents.add(pipelineName + "_" +  job.getId() + "_cp_chains");
+        return parents;
+    }
+
+    private boolean isChainJob(List<Input> inputs) {
+        for (Input input : inputs)
+            if (!input.getChainOutput().isEmpty())
+                return true;
+        return false;
+    }
+
+    private boolean isChainJob(List<Input> inputs, String parent) {
+        for (Input input : inputs)
+            if (!input.getChainOutput().isEmpty() && input.getOriginStep().equals(parent))
+                return true;
+        return false;
     }
 
     private Container getContainerInfo(SimpleJob job) {
@@ -420,33 +464,34 @@ public class MesosExecutor implements IExecutor {
         return dockerUri;
     }
 
-    private void copyInput(String parent, String id, String destDir, String outDir, String value) throws ExecutorException {
+    private String getCopyInputCommand(String destDir, String outDir, String value) {
         String createDestDir = "mkdir -p " + destDir;
         String copyInputs = " && cp -R " + outDir + value + " " + destDir;
-        String changePermissions = " && chmod -R 777 " + destDir;
-        parent = "validateOutputs_" + parent;
+        String changePermissions = " && sudo chmod -R 777 " + destDir;
+
+        return createDestDir + copyInputs + changePermissions;
+    }
+
+    private void getCopyChainInputsChronosJob(String id, String executeCmd, List<String> parents) throws ExecutorException {
         try {
-            String executeCmd = createDestDir + copyInputs + changePermissions;
-            String copyTask = getDependentChronosJob(executeCmd, Collections.singletonList(parent), id);
+            String copyTask = getDependentChronosJob(executeCmd, parents, id);
             HttpUtils.post(mesosInfo.getChronosEndPoint() + CHRONOS_DEPENDENCY, copyTask);
         } catch (IOException e) {
-            logger.error("Error copying input: " + value , e);
-            throw new ExecutorException("Error copying input: " + value , e);
+            logger.error("Error copying inputs to: " + id, e);
+            throw new ExecutorException("Error copying inputs to: " + id, e);
         }
     }
 
-    private String getDependentChronosJob(String executeCmd, List<String> parents, String id) throws IOException {
+    private String getDependentChronosJob(String executeCmd, List<String> parents, String name) throws IOException {
         String epsilon = "P1Y12M12D";
         String shell = "true";
-        String name = id + "_" + (parents.size() == 1 ? parents.get(0) : "");
         ChronosJob chronosJob = new ChronosJob(parents, epsilon, "0.5f", shell, executeCmd, name, "512");
         return JacksonUtils.serialize(chronosJob);
     }
 
     private void updateEnvironment(Environment environment) {
-        String localWorkDir = this.workingDirectory;
-        environment.setWorkDirectory(environment.getWorkDirectory().replace(localWorkDir, mesosInfo.getBaseDirectory()));
-        environment.setOutputsDirectory(environment.getOutputsDirectory().replace(localWorkDir, mesosInfo.getBaseDirectory()));
+        environment.setWorkDirectory(environment.getWorkDirectory().replace("\\", FILE_SEPARATOR));
+        environment.setOutputsDirectory(environment.getOutputsDirectory().replace("\\", FILE_SEPARATOR));
     }
 
     private SSHConfig getSshConfig() {
@@ -479,6 +524,7 @@ public class MesosExecutor implements IExecutor {
             SSHConfig config = getSshConfig();
             if (channelSftp == null)
                 channelSftp = SSHUtils.getChannelSftp(config);
+
             String pipeline_dir = mesosInfo.getBaseDirectory() + FILE_SEPARATOR + pipelineName;
             SSHUtils.upload(pipeline_dir, destInput, value, channelSftp, FILE_SEPARATOR);
             input.setValue(pipeline_dir + FILE_SEPARATOR + value.substring(value.lastIndexOf(File.separatorChar) + 1));
