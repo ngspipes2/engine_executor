@@ -21,8 +21,7 @@ import pt.isel.ngspipes.engine_executor.entities.VagrantConfig;
 import pt.isel.ngspipes.engine_executor.entities.VagrantSshConfig;
 import pt.isel.ngspipes.engine_executor.utils.ProcessRunner;
 
-import java.io.File;
-import java.io.IOException;
+import java.io.*;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
@@ -136,9 +135,17 @@ public class VagrantExecutor extends LocalExecutor {
     private void createAndCopyVMFiles(Pipeline pipeline) throws IOException {
         createVmConfigFile(pipeline);
         String vagrantFileName = "Vagrantfile";
-        File source = getVagrantFile(vagrantFileName);
         String destPath = pipeline.getEnvironment().getWorkDirectory() + fileSeparator + vagrantFileName;
-        Files.copy(Paths.get(source.getPath()), Paths.get(destPath), StandardCopyOption.REPLACE_EXISTING);
+        String vagrantFileContent = readVagrantFile();
+        IOUtils.writeFile(destPath, vagrantFileContent);
+    }
+
+    private String readVagrantFile() {
+        InputStream in = getClass().getResourceAsStream("/Vagrantfile");
+        BufferedReader reader = new BufferedReader(new InputStreamReader(in));
+        StringBuilder sb = new StringBuilder();
+        reader.lines().forEach((line) -> sb.append(line).append("\n"));
+        return sb.toString();
     }
 
     private void initVM(Pipeline pipeline) throws ExecutorException {
@@ -154,12 +161,6 @@ public class VagrantExecutor extends LocalExecutor {
         String workDirectory = pipeline.getEnvironment().getWorkDirectory();
         String vagrantConfig = getVmConfigFileContent(pipeline);
         IOUtils.writeFile(workDirectory + fileSeparator + CONFIG_NAME, vagrantConfig);
-    }
-
-    private File getVagrantFile(String vagrantFileName) {
-        ClassLoader classLoader = getClass().getClassLoader();
-        File file = new File(classLoader.getResource(vagrantFileName).getFile());
-        return file;
     }
 
     private String getVmConfigFileContent(Pipeline pipeline) throws IOException {
