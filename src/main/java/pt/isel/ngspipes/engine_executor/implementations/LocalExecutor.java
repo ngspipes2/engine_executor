@@ -2,6 +2,7 @@ package pt.isel.ngspipes.engine_executor.implementations;
 
 import com.github.brunomndantas.tpl4j.factory.TaskFactory;
 import com.github.brunomndantas.tpl4j.task.Task;
+import org.apache.commons.io.FilenameUtils;
 import org.apache.logging.log4j.Logger;
 import pt.isel.ngspipes.engine_common.entities.ExecutionNode;
 import pt.isel.ngspipes.engine_common.entities.ExecutionState;
@@ -20,11 +21,11 @@ import pt.isel.ngspipes.engine_common.utils.ValidateUtils;
 import java.io.File;
 import java.io.IOException;
 import java.util.*;
+import java.util.stream.Collectors;
 
 public abstract class LocalExecutor implements IExecutor {
 
     private final Map<String, Map<Job, Task<Void>>> TASKS_BY_EXEC_ID = new HashMap<>();
-    final Map<String, Pipeline> pipelines = new HashMap<>();
     final Logger logger;
     final String tag;
     final String fileSeparator;
@@ -43,7 +44,6 @@ public abstract class LocalExecutor implements IExecutor {
     public boolean stop(String executionId) throws ExecutorException {
         if (TASKS_BY_EXEC_ID.containsKey(executionId))
             TASKS_BY_EXEC_ID.get(executionId).values().forEach(Task::cancel);
-
         return true;
     }
 
@@ -93,7 +93,8 @@ public abstract class LocalExecutor implements IExecutor {
             TASKS_BY_EXEC_ID.put(pipeline.getName(), new HashMap<>());
             pipeline.getState().setState(StateEnum.RUNNING);
         }
-        Map<Job, Task<Void>> taskMap = new HashMap<>();
+
+        Map<Job, Task<Void>> taskMap = TASKS_BY_EXEC_ID.get(pipeline.getName());
         createTasks(graph, pipeline, taskMap);
         scheduleFinishPipelineTask(pipeline, taskMap);
         scheduleChildTasks(pipeline, taskMap);
@@ -135,6 +136,20 @@ public abstract class LocalExecutor implements IExecutor {
     private void scheduleFinishPipelineTask(Pipeline pipeline, Map<Job, Task<Void>> taskMap) {
         Task<Void> task = TaskFactory.create("finish" + pipeline.getName(), () -> {
             try {
+                boolean allSuccess = true;
+                do {
+                    for (Map.Entry<Job, Task<Void>> entry : taskMap.entrySet()) {
+                        if (!allSuccess)
+                            break;
+                        Job job = entry.getKey();
+                        if (job.getState().getState().equals(StateEnum.FAILED))
+                            throw job.getState().getException();
+                        allSuccess = job.getState().getState().equals(StateEnum.SUCCESS);
+                    }
+                    if (allSuccess)
+                        break;
+                    Thread.sleep(5000);
+                } while (true);
                 finishSuccessfully(pipeline);
             } catch (Exception e) {
                 reporter.reportError("Error finishing pipeline");
@@ -160,12 +175,18 @@ public abstract class LocalExecutor implements IExecutor {
         Job outputJob = pipeline.getJobById(output.getOriginJob());
         try {
             String type = output.getType();
+            String outVal = File.separatorChar + output.getValue().toString();
+            String jobOutputsDirectory = outputJob.getEnvironment().getOutputsDirectory();
             if (type.equalsIgnoreCase("directory")) {
-                String outVal = File.separatorChar + output.getValue().toString();
-                IOUtils.copyDirectory(outputJob.getEnvironment().getOutputsDirectory() + outVal, outputDirectory + outVal);
-            } else if (type.equalsIgnoreCase("file") || type.equalsIgnoreCase("file[]")) {
-                String outVal = File.separatorChar + output.getValue().toString();
-                IOUtils.copyFile(outputJob.getEnvironment().getOutputsDirectory() + outVal, outputDirectory + outVal);
+                IOUtils.copyDirectory(jobOutputsDirectory + outVal, outputDirectory + outVal);
+            } else if (type.equalsIgnoreCase("file")) {
+                IOUtils.copyFile(jobOutputsDirectory + outVal, outputDirectory + outVal);
+            } else if (type.equalsIgnoreCase("file[]")) {
+                outVal = outVal.replace("[", "");
+                outVal = outVal.replace("]", "");
+                String[] values = outVal.split(",");
+                for (String value : values)
+                    IOUtils.copyFile(jobOutputsDirectory + value, outputDirectory + value);
             }
         } catch (IOException e) {
             throw new ExecutorException("Error getting pipeline " + output.getName() + " output.", e);
@@ -216,33 +237,63 @@ public abstract class LocalExecutor implements IExecutor {
             job.getState().setState(StateEnum.STAGING);
 
             SimpleJob simpleJob = (SimpleJob) job;
-            if (simpleJob.getSpread() != null) {
-                LinkedList<ExecutionNode> graph = new LinkedList<>();
-                SpreadJobExpander.expandSpreadJob(pipeline, simpleJob, graph, this::getOutputValues, fileSeparator);
-                run(pipeline, graph);
-            } else {
-                execute(pipeline, simpleJob);
-            }
+            execute(pipeline, simpleJob);
 
-            if (job.isInconclusive()) {
-                job.setInconclusive(false);
-                List<Job> childJobs = new LinkedList<>();
-                for (Job childJob : job.getChainsTo()) {
-                    if (childJob.getSpread() != null) {
-                        childJobs.addAll(SpreadJobExpander.getExpandedJobs(pipeline, (SimpleJob) childJob, new LinkedList<>(), this::getOutputValues, fileSeparator));
-                    } else {
-                        childJobs.add(childJob);
-                    }
+            job.getState().setState(StateEnum.SUCCESS);
+            List<Job> readyChildJobs = getReadyChildJobs(simpleJob, pipeline);
+            try {
+                if (!readyChildJobs.isEmpty()) {
+                    List<Job> newChildJobs = getExpandedReadyChildJobs(pipeline, readyChildJobs);
+
+                    Collection<ExecutionNode> childGraph = TopologicSorter.parallelSort(pipeline, newChildJobs);
+                    run(pipeline, childGraph);
+                    job.setInconclusive(false);
                 }
-                Collection<ExecutionNode> childGraph = TopologicSorter.parallelSort(pipeline, childJobs);
-                run(pipeline, childGraph);
+            } catch (EngineCommonException e) {
+                job.getState().setState(StateEnum.FAILED);
+                throw new ExecutorException("Error running job " + job.getId() + ".", e);
             }
 
         } catch (EngineCommonException e) {
             job.getState().setState(StateEnum.FAILED);
             throw new ExecutorException("Error running task " + job.getId(), e);
         }
-        job.getState().setState(StateEnum.SUCCESS);
+    }
+
+    private List<Job> getExpandedReadyChildJobs(Pipeline pipeline, List<Job> readyChildJobs) throws EngineCommonException {
+        List<Job> newChildJobs = new LinkedList<>();
+        for (Job childJob : readyChildJobs) {
+            if (childJob.getSpread() != null) {
+                LinkedList<Job> toRemove = new LinkedList<>();
+                List<Job> expandedJobs = SpreadJobExpander.getExpandedJobs(pipeline, (SimpleJob) childJob, toRemove, this::getOutputValues, fileSeparator);
+                newChildJobs.addAll(expandedJobs);
+                pipeline.removeJobs(toRemove);
+                pipeline.addJobs(expandedJobs);
+            } else {
+                newChildJobs.add(childJob);
+            }
+        }
+        return newChildJobs;
+    }
+
+    private List<Job> getReadyChildJobs(SimpleJob job, Pipeline pipeline) {
+        List<Job> readyChildJobs = new LinkedList<>();
+        synchronized (pipeline) {
+            for (Job childJob : job.getChainsTo()) {
+                if (childJob.isInconclusive() && childJob.getState().getState().equals(StateEnum.STAGING) && areParentsExecuted(childJob.getChainsFrom())) {
+                    childJob.setInconclusive(false);
+                    readyChildJobs.add(childJob);
+                }
+            }
+        }
+        return readyChildJobs;
+    }
+
+    private boolean areParentsExecuted(List<Job> chainsFrom) {
+        for (Job parent : chainsFrom)
+            if (!parent.getState().getState().equals(StateEnum.SUCCESS))
+                return false;
+        return true;
     }
 
     private void execute(Pipeline pipeline, SimpleJob stepCtx) throws ExecutorException {
@@ -294,24 +345,73 @@ public abstract class LocalExecutor implements IExecutor {
         String jobId = job.getId();
         String destDir = job.getEnvironment().getWorkDirectory() + File.separatorChar;
 
-        for (Input inputCtx : job.getInputs()) {
-            if (!inputCtx.getOriginStep().equals(jobId)) {
-                Job chainStep = pipeline.getJobById(inputCtx.getOriginStep());
-                String outDir = chainStep.getEnvironment().getOutputsDirectory() + fileSeparator;
-                Output outCtx = chainStep.getOutputById(inputCtx.getChainOutput());
-                List<String> usedBy = outCtx.getUsedBy();
+        if (!destDir.contains(jobId)) {
+            destDir = destDir + jobId + File.separatorChar;
+        }
 
-                if (usedBy != null) {
-                    for (String dependent : usedBy) {
-                        Output outputCtx = chainStep.getOutputById(dependent);
-                        String value = outputCtx.getValue().toString();
-                        copyInput(destDir, outDir, value, outputCtx.getType());
-                    }
+        for (Input inputCtx : job.getInputs()) {
+            if (inputCtx.getOriginStep().stream().noneMatch((stepId) -> stepId.equals(jobId))) {
+                List<Job> chainSteps = inputCtx.getOriginJob().stream().map((j) -> {
+                    if(!j.getId().equals(jobId))
+                        return j;
+                    else
+                        return null;
+                }).collect(Collectors.toList());
+
+                Job chainStep = chainSteps.get(0);
+                String outDir = chainStep.getEnvironment().getOutputsDirectory();
+                Output outCtx = chainStep.getOutputById(inputCtx.getChainOutput());
+
+                if (chainSteps.size() > 1) {
+                    addJoinChainInputsCommands(destDir, inputCtx, outDir, outCtx.getType());
                 } else {
-                    String value = outCtx.getValue().toString();
-                    copyInput(destDir, outDir, value, outCtx.getType());
+                    List<String> usedBy = outCtx.getUsedBy();
+                    if (usedBy != null && !chainStep.isInconclusive()) {
+                        for (String dependent : usedBy) {
+                            Output outputCtx = chainStep.getOutputById(dependent);
+                            String value = outputCtx.getValue().toString();
+                            copyInput(destDir, outDir + File.separatorChar, value, outCtx.getType());
+                        }
+                    } else {
+                        String value = inputCtx.getValue();
+                        copyInput(destDir, outDir + File.separatorChar, value, outCtx.getType());
+                    }
                 }
+//               for (Job chainStep : chainSteps) {
+//                   String outDir = chainStep.getEnvironment().getOutputsDirectory() + fileSeparator;
+//                   Output outCtx = chainStep.getOutputById(inputCtx.getChainOutput());
+//                   List<String> usedBy = outCtx.getUsedBy();
+//
+//                   if (usedBy != null) {
+//                       for (String dependent : usedBy) {
+//                           Output outputCtx = chainStep.getOutputById(dependent);
+//                           String value = outputCtx.getValue().toString();
+//                           copyInput(destDir, outDir, value, outputCtx.getType());
+//                       }
+//                   } else {
+//                       String value = outCtx.getValue().toString();
+//                       copyInput(destDir, outDir, value, outCtx.getType());
+//                   }
+//               }
             }
+        }
+    }
+
+    private void addJoinChainInputsCommands(String destDir, Input inputCtx, String outDir, String type) throws ExecutorException {
+        outDir = outDir.substring(0, outDir.lastIndexOf(fileSeparator));
+        String value = inputCtx.getValue().replace("[", "").replace("]", "");
+        String[] values = value.split(",");
+        outDir = outDir + fileSeparator;
+        for (String val : values) {
+            String currOutDir = outDir;
+            int separatorIndex = val.indexOf(fileSeparator) + 1;
+            if (separatorIndex > 0) {
+                String subDir = val.substring(0, separatorIndex);
+                if (!currOutDir.contains(subDir))
+                    currOutDir = currOutDir + subDir;
+            }
+
+            copyInput(destDir, outDir, val, type);
         }
     }
 
@@ -319,13 +419,12 @@ public abstract class LocalExecutor implements IExecutor {
         try {
             String source = outDir + value;
             source = source.replace(fileSeparator, File.separatorChar + "");
+            destDir = destDir + value;
             destDir = destDir.replace(fileSeparator, File.separatorChar + "");
             if (type.equals("directory"))
-                IOUtils.copyDirectory(source, destDir + value);
+                IOUtils.copyDirectory(source, destDir);
             else {
-                if (value.contains(fileSeparator))
-                    value = value.substring(value.indexOf(fileSeparator) + 1);
-                IOUtils.copyFile(source, destDir + value);
+                IOUtils.copyFile(source, destDir);
             }
         } catch (IOException e) {
             throw new ExecutorException("Error copying input: " + value , e);
@@ -370,7 +469,7 @@ public abstract class LocalExecutor implements IExecutor {
 
     private void copyInput(Job job, Input input) throws ExecutorException {
         String type = input.getType();
-        if (type.equalsIgnoreCase("file") || type.equalsIgnoreCase("directory") || type.equalsIgnoreCase("file[]")) {
+        if (type.contains("file") || type.equalsIgnoreCase("directory")) {
             if (input.getChainOutput() == null || input.getChainOutput().isEmpty()) {
                 String value = input.getValue();
                 if (type.equalsIgnoreCase("directory")) {

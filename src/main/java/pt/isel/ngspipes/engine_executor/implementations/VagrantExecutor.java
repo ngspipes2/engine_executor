@@ -22,9 +22,6 @@ import pt.isel.ngspipes.engine_executor.entities.VagrantSshConfig;
 import pt.isel.ngspipes.engine_executor.utils.ProcessRunner;
 
 import java.io.*;
-import java.nio.file.Files;
-import java.nio.file.Paths;
-import java.nio.file.StandardCopyOption;
 
 public class VagrantExecutor extends LocalExecutor {
 
@@ -64,16 +61,8 @@ public class VagrantExecutor extends LocalExecutor {
     @Override
     String getExecutionCommand(SimpleJob job, Pipeline pipeline) throws ExecutorException {
         try {
-            ICommandBuilder commandBuilder = CommandBuilderSupplier.getCommandBuilder(job.getExecutionContext().getContext());
-            String cmdBuilt = commandBuilder.build(pipeline, job, fileSeparator, job.getExecutionContext().getConfig());
-            StringBuilder command = new StringBuilder("\\config ");
-            command .append(TAG)
-                    .append(pipeline.getName())
-                    .append(" ")
-                    .append(cmdBuilt);
-            String commandStr = command.toString();
-            commandStr = commandStr.replace(workingDirectory, BASE_DIRECTORY).replace(File.separatorChar + "", fileSeparator);
-            String ssh = "ssh -F " + workingDirectory + File.separatorChar + pipeline.getName();
+            String commandStr = getJobBuildedCommand(job, pipeline);
+            String ssh = getSshCommand(pipeline);
             return ssh + commandStr;
         } catch (CommandBuilderException e) {
             logger.error(TAG + ":: Error when building step - " + job.getId(), e);
@@ -81,10 +70,32 @@ public class VagrantExecutor extends LocalExecutor {
         }
     }
 
+    private String getJobBuildedCommand(SimpleJob job, Pipeline pipeline) throws CommandBuilderException {
+        ICommandBuilder commandBuilder = CommandBuilderSupplier.getCommandBuilder(job.getExecutionContext().getContext());
+        String cmdBuilt = commandBuilder.build(pipeline, job, fileSeparator, job.getExecutionContext().getConfig());
+        StringBuilder command = new StringBuilder("\\config ");
+        command .append(TAG)
+                .append(pipeline.getName())
+                .append(" ")
+                .append(cmdBuilt);
+        String commandStr = command.toString();
+        commandStr = commandStr.replace(workingDirectory, BASE_DIRECTORY).replace(File.separatorChar + "", fileSeparator);
+        return commandStr;
+    }
+
+    private String getSshCommand(Pipeline pipeline) {
+        StringBuilder ssh = new StringBuilder("ssh -F ");
+        ssh .append(workingDirectory)
+            .append(File.separatorChar)
+            .append(pipeline.getName());
+        return ssh.toString();
+    }
+
     @Override
     void executeJob(String executeCmd, Job job, Pipeline pipeline) throws ExecutorException {
         try {
-            ProcessRunner.runOnSpecificFolder(executeCmd, reporter, workingDirectory + File.separatorChar + pipeline.getName());
+            int exitCode = ProcessRunner.run(executeCmd, workingDirectory + File.separatorChar + pipeline.getName(), reporter);
+            System.out.println(exitCode);
         } catch (EngineCommonException e) {
             throw new ExecutorException("", e);
         }
@@ -112,12 +123,6 @@ public class VagrantExecutor extends LocalExecutor {
     }
 
     private void createConfigSsh(Pipeline pipeline) throws ExecutorException {
-//        try {
-//            String cmd = "vagrant ssh-config " + TAG + pipeline.getName();
-//            ProcessRunner.runOnSpecificFolder(cmd, reporter, workingDirectory + File.separatorChar + pipeline.getName());
-//        } catch (EngineCommonException e) {
-//            throw new ExecutorException("", e);
-//        }
         String host = TAG + pipeline.getName();
         String machinePath = workingDirectory + File.separatorChar +
                             pipeline.getName() + File.separatorChar +
@@ -151,7 +156,7 @@ public class VagrantExecutor extends LocalExecutor {
     private void initVM(Pipeline pipeline) throws ExecutorException {
         String workDirectory = workingDirectory + File.separatorChar + pipeline.getName();
         try {
-            ProcessRunner.runOnSpecificFolder("vagrant up" , reporter, workDirectory);
+            ProcessRunner.run("vagrant up", workDirectory , reporter);
         } catch (EngineCommonException e) {
             throw new ExecutorException("Error initiating vagrant machine " + tag + pipeline.getName() + ".", e);
         }
@@ -178,7 +183,7 @@ public class VagrantExecutor extends LocalExecutor {
         String workDirectory = pipeline.getEnvironment().getWorkDirectory();
         try {
             String command = "vagrant destroy " + this.getClass().getSimpleName() + pipeline.getName() + " -f";
-            ProcessRunner.runOnSpecificFolder(command, reporter, workDirectory);
+            ProcessRunner.run(command, workDirectory, reporter);
         } catch (EngineCommonException e) {
             throw new ExecutorException("Error destroying vagrant machine " + tag + pipeline.getName() + ".", e);
         }

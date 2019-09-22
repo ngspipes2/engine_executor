@@ -29,45 +29,14 @@ public class ProcessRunner {
     private static void logStream(InputStream in, InternalReporter reporter) throws IOException, ProgressReporterException {
 
         String line;
-        StringBuilder sb = new StringBuilder();
-
         try (BufferedReader bf = new BufferedReader(new InputStreamReader(in, Charset.forName("UTF-8")))) {
             while ((line = bf.readLine()) != null) {
-                sb.append(line).append("\n");
                 reporter.report(line);
             }
-        } finally {
-//            if (sb.length() != 0)
-//                logger.error(sb.toString());
-
         }
     }
 
-    public static void runOnSpecificFolder(String command, IExecutionProgressReporter reporter, String workDirectory) throws EngineCommonException {
-        ExceptionBox inputBox = new ExceptionBox();
-        ExceptionBox errorBox = new ExceptionBox();
-        Process p;
-
-        try {
-            logger.trace("Executing command: " + command);
-            p = Runtime.getRuntime().exec(command, null, new File(workDirectory));
-
-            Thread inputThread = createThread(() -> logStream(p.getInputStream(), reporter::reportInfo), inputBox);
-            Thread errorThread = createThread(() -> logStream(p.getErrorStream(), reporter::reportInfo), errorBox);
-
-            inputThread.join();
-            errorThread.join();
-        } catch (Throwable ex) {
-            try {
-                reporter.reportInfo(ex.getMessage());
-            } catch (ProgressReporterException e) {
-                e.printStackTrace();
-            }
-            throw new EngineCommonException("Error executing command " + command, ex);
-        }
-    }
-
-    public static void run(String command, String workingDirectory, IExecutionProgressReporter reporter) throws EngineCommonException {
+    public static int run(String command, String workingDirectory, IExecutionProgressReporter reporter) throws EngineCommonException {
         ExceptionBox inputBox = new ExceptionBox();
         ExceptionBox errorBox = new ExceptionBox();
         Process p;
@@ -101,6 +70,7 @@ public class ProcessRunner {
             String message = "Command " + command + " finished with Exit Code = " + exitCode;
             logger.trace(message);
             reporter.reportInfo(message);
+            return exitCode;
         } catch (Exception ex) {
             throw new EngineCommonException("Error executing command " + command, ex);
         }

@@ -3,6 +3,10 @@ package pt.isel.ngspipes.engine_executor.utils;
 import com.jcraft.jsch.*;
 
 import java.io.*;
+import java.nio.file.FileSystems;
+import java.nio.file.Path;
+import java.nio.file.PathMatcher;
+import java.nio.file.Paths;
 import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -57,6 +61,19 @@ public class SSHUtils {
         }
     }
 
+    public static List<String> getFilesNameByPattern(ChannelSftp channelSftp, String pattern, String filesPath) throws SftpException {
+        List<String> filesName = new LinkedList<>();
+        PathMatcher matcher = FileSystems.getDefault().getPathMatcher("glob:" + pattern);
+        Vector filelist = channelSftp.ls(filesPath);
+        for(int i=0; i< filelist.size(); i++){
+            ChannelSftp.LsEntry entry = (ChannelSftp.LsEntry) filelist.get(i);
+            String filename = entry.getFilename();
+            Path path = Paths.get(entry.getFilename());
+            if (!IGNORE_FILES.contains(filename) && matcher.matches(path))
+                filesName.add(filename);
+        }
+        return filesName;
+    }
 
 
     private static void downloadListOfFiles(String base_dir, String dest, String source, ChannelSftp sftp) throws SftpException, IOException {
