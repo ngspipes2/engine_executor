@@ -108,18 +108,18 @@ public class MesosExecutor implements IExecutor {
         logger.trace(TAG + ":: Copying pipeline " + pipeline.getName() + " inputs.");
 
         updateEnvironment(pipeline.getEnvironment());
-        ChannelSftp sftp = null;
         try {
             SSHConfig config = getSshConfig();
-            sftp = SSHUtils.getChannelSftp(config);
-            SSHUtils.createIfNotExist(mesosInfo.getBaseDirectory(), pipeline.getEnvironment().getWorkDirectory(), sftp, FILE_SEPARATOR);
+            if (channelSftp == null)
+                channelSftp = SSHUtils.getChannelSftp(config);
+            SSHUtils.createIfNotExist(mesosInfo.getBaseDirectory(), pipeline.getEnvironment().getWorkDirectory(), channelSftp, FILE_SEPARATOR);
         } catch (JSchException | SftpException e) {
             throw new ExecutorException("Error connecting server " + mesosInfo.getSshHost());
         } finally {
-            if(sftp != null) {
-                sftp.disconnect();
+            if(channelSftp != null) {
+                channelSftp.disconnect();
                 try {
-                    sftp.getSession().disconnect();
+                    channelSftp.getSession().disconnect();
                 } catch (JSchException e) {
                     ExecutorException ex = new ExecutorException("Error copying inputs.", e);
                     ExecutionState state = new ExecutionState(StateEnum.FAILED, ex);
